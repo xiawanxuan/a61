@@ -24,6 +24,7 @@ from metadata_collector import (
     IndexMetadata,
     ConstraintMetadata,
     PartitionMetadata,
+    PartitionIndexMetadata,
 )
 from diff_engine import DiffEngine, DiffType, DiffItem, DiffResult
 from ddl_executor import DDLGenerator, DDLExecutor, GeneratedDDL
@@ -50,6 +51,7 @@ __all__ = [
     "IndexMetadata",
     "ConstraintMetadata",
     "PartitionMetadata",
+    "PartitionIndexMetadata",
     "DiffEngine",
     "DiffType",
     "DiffItem",

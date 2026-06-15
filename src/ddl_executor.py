@@ -112,6 +112,11 @@ class DDLGenerator:
             DiffType.CHUNK_INTERVAL_CHANGED: self._generate_alter_chunk_interval,
             DiffType.COMPRESSION_CONFIG_CHANGED: self._generate_compression_config,
             DiffType.RETENTION_CONFIG_CHANGED: self._generate_retention_config,
+            DiffType.PARTITION_INDEX_ADDED: self._generate_partition_index_added,
+            DiffType.PARTITION_INDEX_DROPPED: self._generate_partition_index_dropped,
+            DiffType.PARTITION_INDEX_DEFINITION_CHANGED: self._generate_partition_index_changed,
+            DiffType.HYPERTABLE_INDEX_PROPAGATED: self._generate_hypertable_index_propagation,
+            DiffType.SPACE_PARTITION_CONFIG_CHANGED: self._generate_space_partition_config,
         }
 
         handler = handlers.get(diff_type)
@@ -347,35 +352,64 @@ class DDLGenerator:
         self, diff: DiffItem, full_table_name: str, target_db: str
     ) -> Tuple[str, str, OperationType]:
         extra_info = diff.extra_info
-        action = extra_info.get("action")
-        expected = extra_info.get("expected", {})
+        config_type = extra_info.get("config_type")
+        source_val = diff.source_value
+        target_val = diff.target_value
 
-        if action == "enable_compression":
-            compress_after = expected.get("compress_after", "interval '7 days'")
-            segmentby = expected.get("segmentby", [])
-            orderby = expected.get("orderby", [])
+        if config_type == "compression_enabled":
+            action = extra_info.get("action")
+            if action == "enable_compression":
+                ts_config = self.sync_config.timescale_config
+                compression = ts_config.compression
+                compress_after = compression.get("compress_after", "interval '7 days'")
+                segmentby = compression.get("segmentby", [])
+                orderby = compression.get("orderby", [])
 
-            alter_sql = f'ALTER TABLE {full_table_name} SET (timescaledb.compress = true'
+                alter_sql = f'ALTER TABLE {full_table_name} SET (timescaledb.compress = true'
+                if segmentby:
+                    alter_sql += f", timescaledb.compress_segmentby = '{','.join(segmentby)}'"
+                if orderby:
+                    alter_sql += f", timescaledb.compress_orderby = '{','.join(orderby)}'"
+                alter_sql += ')'
+
+                policy_sql = f"SELECT add_compression_policy('{full_table_name}', {compress_after})"
+                full_sql = f"{alter_sql};\n{policy_sql}"
+
+                rollback_sql = f"SELECT remove_compression_policy('{full_table_name}');\nALTER TABLE {full_table_name} SET (timescaledb.compress = false)"
+
+                return full_sql, rollback_sql, OperationType.SET_COMPRESSION
+            elif action == "disable_compression":
+                disable_sql = f"SELECT remove_compression_policy('{full_table_name}');\nALTER TABLE {full_table_name} SET (timescaledb.compress = false)"
+                rollback_sql = f"ALTER TABLE {full_table_name} SET (timescaledb.compress = true)"
+                return disable_sql, rollback_sql, OperationType.SET_COMPRESSION
+
+        if config_type == "compress_after":
+            target_after = target_val
+            source_after = source_val
+
+            alter_sql = f"SELECT remove_compression_policy('{full_table_name}');\nSELECT add_compression_policy('{full_table_name}', {target_after})"
+            rollback_sql = f"SELECT remove_compression_policy('{full_table_name}');\nSELECT add_compression_policy('{full_table_name}', {source_after})"
+
+            return alter_sql, rollback_sql, OperationType.SET_COMPRESSION
+
+        if config_type in ("segmentby", "orderby"):
+            ts_config = self.sync_config.timescale_config
+            compression = ts_config.compression
+            compress_after = compression.get("compress_after", "interval '7 days'")
+            segmentby = compression.get("segmentby", [])
+            orderby = compression.get("orderby", [])
+
+            alter_sql = f"SELECT remove_compression_policy('{full_table_name}');"
+            alter_sql += f"\nALTER TABLE {full_table_name} SET (timescaledb.compress = true"
             if segmentby:
                 alter_sql += f", timescaledb.compress_segmentby = '{','.join(segmentby)}'"
             if orderby:
                 alter_sql += f", timescaledb.compress_orderby = '{','.join(orderby)}'"
             alter_sql += ')'
+            alter_sql += f"\nSELECT add_compression_policy('{full_table_name}', {compress_after})"
 
-            policy_sql = f"SELECT add_compression_policy('{full_table_name}', {compress_after})"
-            full_sql = f"{alter_sql};\n{policy_sql}"
-
-            rollback_sql = f"SELECT remove_compression_policy('{full_table_name}');\nALTER TABLE {full_table_name} SET (timescaledb.compress = false)"
-
-            return full_sql, rollback_sql, OperationType.SET_COMPRESSION
-
-        config_type = extra_info.get("config_type")
-        if config_type == "compress_after":
-            expected_after = diff.target_value
-            source_after = diff.source_value
-
-            alter_sql = f"SELECT remove_compression_policy('{full_table_name}');\nSELECT add_compression_policy('{full_table_name}', {expected_after})"
-            rollback_sql = f"SELECT remove_compression_policy('{full_table_name}');\nSELECT add_compression_policy('{full_table_name}', {source_after})"
+            rollback_sql = f"SELECT remove_compression_policy('{full_table_name}');"
+            rollback_sql += f"\nALTER TABLE {full_table_name} RESET (timescaledb.compress)"
 
             return alter_sql, rollback_sql, OperationType.SET_COMPRESSION
 
@@ -384,15 +418,164 @@ class DDLGenerator:
     def _generate_retention_config(
         self, diff: DiffItem, full_table_name: str, target_db: str
     ) -> Tuple[str, str, OperationType]:
-        expected_drop_after = diff.extra_info.get("expected_drop_after")
+        extra_info = diff.extra_info
+        config_type = extra_info.get("config_type")
 
-        if expected_drop_after:
-            alter_sql = f"SELECT add_retention_policy('{full_table_name}', {expected_drop_after})"
-            rollback_sql = f"SELECT remove_retention_policy('{full_table_name}')"
+        if config_type == "retention_enabled":
+            target_has_retention = extra_info.get("target_has_retention", False)
+            if not target_has_retention:
+                ts_config = self.sync_config.timescale_config
+                drop_after = ts_config.retention.get("drop_after", "interval '365 days'")
+                alter_sql = f"SELECT add_retention_policy('{full_table_name}', {drop_after})"
+                rollback_sql = f"SELECT remove_retention_policy('{full_table_name}')"
+                return alter_sql, rollback_sql, OperationType.SET_RETENTION
+            else:
+                alter_sql = f"SELECT remove_retention_policy('{full_table_name}')"
+                rollback_sql = f"SELECT add_retention_policy('{full_table_name}', interval '365 days')"
+                return alter_sql, rollback_sql, OperationType.SET_RETENTION
+
+        if config_type == "drop_after":
+            target_drop_after = diff.target_value
+            source_drop_after = diff.source_value
+
+            if target_drop_after:
+                alter_sql = f"SELECT remove_retention_policy('{full_table_name}');\nSELECT add_retention_policy('{full_table_name}', {target_drop_after})"
+            else:
+                alter_sql = f"SELECT remove_retention_policy('{full_table_name}')"
+
+            if source_drop_after:
+                rollback_sql = f"SELECT remove_retention_policy('{full_table_name}');\nSELECT add_retention_policy('{full_table_name}', {source_drop_after})"
+            else:
+                rollback_sql = f"SELECT remove_retention_policy('{full_table_name}')"
 
             return alter_sql, rollback_sql, OperationType.SET_RETENTION
 
         return "", "", OperationType.SET_RETENTION
+
+    def _generate_partition_index_added(
+        self, diff: DiffItem, full_table_name: str, target_db: str
+    ) -> Tuple[str, str, OperationType]:
+        extra_info = diff.extra_info
+        config_type = extra_info.get("config_type")
+        is_hypertable = extra_info.get("is_hypertable", False)
+
+        if config_type == "partition_index_coverage":
+            parent_index = extra_info.get("parent_index", "")
+            if is_hypertable and parent_index:
+                alter_sql = f"-- Index '{parent_index}' may not be fully propagated to all chunks\n"
+                alter_sql += f"-- Re-creating index to ensure full propagation:\n"
+                alter_sql += f"DROP INDEX IF EXISTS {diff.schema}.{parent_index} CASCADE;\n"
+                alter_sql += f"-- Re-run original CREATE INDEX statement for full propagation\n"
+
+                source_index_def = extra_info.get("source_index_def", "")
+                if source_index_def:
+                    alter_sql += f"{source_index_def}"
+
+                rollback_sql = f"-- Rollback: Index propagation cannot be easily reversed\n"
+                rollback_sql += f"-- Manual intervention may be required"
+
+                return alter_sql, rollback_sql, OperationType.ADD_INDEX
+            else:
+                return "", "", OperationType.ADD_INDEX
+
+        source_idx = diff.source_value
+        if source_idx and hasattr(source_idx, 'index_definition'):
+            create_sql = source_idx.index_definition
+            drop_sql = f'DROP INDEX IF EXISTS "{diff.schema}"."{source_idx.index_name}" CASCADE'
+            return create_sql, drop_sql, OperationType.ADD_INDEX
+
+        return "", "", OperationType.ADD_INDEX
+
+    def _generate_partition_index_dropped(
+        self, diff: DiffItem, full_table_name: str, target_db: str
+    ) -> Tuple[str, str, OperationType]:
+        target_idx = diff.target_value
+        if target_idx and hasattr(target_idx, 'index_definition'):
+            drop_sql = f'DROP INDEX IF EXISTS "{diff.schema}"."{target_idx.index_name}" CASCADE'
+            create_sql = target_idx.index_definition
+            return drop_sql, create_sql, OperationType.DROP_INDEX
+
+        return "", "", OperationType.DROP_INDEX
+
+    def _generate_partition_index_changed(
+        self, diff: DiffItem, full_table_name: str, target_db: str
+    ) -> Tuple[str, str, OperationType]:
+        source_idx = diff.source_value
+        target_idx = diff.target_value
+
+        if source_idx and target_idx and hasattr(source_idx, 'index_definition'):
+            drop_sql = f'DROP INDEX IF EXISTS "{diff.schema}"."{target_idx.index_name}" CASCADE'
+            create_sql = source_idx.index_definition
+            full_sql = f"{drop_sql};\n{create_sql}"
+
+            rollback_drop = f'DROP INDEX IF EXISTS "{diff.schema}"."{source_idx.index_name}" CASCADE'
+            rollback_create = target_idx.index_definition
+            rollback_sql = f"{rollback_drop};\n{rollback_create}"
+
+            return full_sql, rollback_sql, OperationType.ADD_INDEX
+
+        return "", "", OperationType.ADD_INDEX
+
+    def _generate_hypertable_index_propagation(
+        self, diff: DiffItem, full_table_name: str, target_db: str
+    ) -> Tuple[str, str, OperationType]:
+        extra_info = diff.extra_info
+        parent_index = extra_info.get("parent_index", diff.index_name)
+        source_index_def = extra_info.get("source_index_def", "")
+
+        sql_lines = [
+            f"-- Hypertable index propagation check for: {parent_index}",
+            f"-- Source chunks with index: {diff.source_value.get('chunk_index_count', 'N/A') if diff.source_value else 'N/A'}",
+            f"-- Target chunks with index: {diff.target_value.get('chunk_index_count', 'N/A') if diff.target_value else 'N/A'}",
+            f"-- Re-creating index to ensure propagation to all chunks:",
+            f"DROP INDEX IF EXISTS {diff.schema}.{parent_index} CASCADE;",
+        ]
+
+        if source_index_def:
+            sql_lines.append(source_index_def)
+        else:
+            sql_lines.append(f"-- Original index definition unavailable - manual re-creation required")
+
+        full_sql = "\n".join(sql_lines)
+
+        rollback_sql = (
+            f"-- Rollback: Index propagation cannot be easily reversed\n"
+            f"-- Manual intervention may be required to restore previous state"
+        )
+
+        return full_sql, rollback_sql, OperationType.ADD_INDEX
+
+    def _generate_space_partition_config(
+        self, diff: DiffItem, full_table_name: str, target_db: str
+    ) -> Tuple[str, str, OperationType]:
+        extra_info = diff.extra_info
+        config_type = extra_info.get("config_type")
+        source_val = diff.source_value
+        target_val = diff.target_value
+
+        sql_lines = [f"-- Space partition configuration change: {config_type}"]
+        rollback_lines = [f"-- Rollback for space partition {config_type} change"]
+
+        if config_type == "num_dimensions":
+            sql_lines.append(f"-- WARNING: Changing number of dimensions requires re-creating the hypertable")
+            sql_lines.append(f"-- Current dimensions: {target_val}")
+            sql_lines.append(f"-- Target dimensions: {source_val}")
+            sql_lines.append(f"-- Manual migration required: create_new_hypertable -> copy_data -> swap_tables")
+
+            rollback_lines.append(f"-- Reverse migration required to restore original dimensions")
+
+        elif config_type == "partitioning_column":
+            sql_lines.append(f"-- WARNING: Changing space partitioning column requires re-creating the hypertable")
+            sql_lines.append(f"-- Current column: {target_val}")
+            sql_lines.append(f"-- Target column: {source_val}")
+            sql_lines.append(f"-- Manual migration required")
+
+            rollback_lines.append(f"-- Reverse migration required to restore original partitioning column")
+
+        full_sql = "\n".join(sql_lines)
+        rollback_sql = "\n".join(rollback_lines)
+
+        return full_sql, rollback_sql, OperationType.ALTER_PARTITION
 
     def _map_column_type(self, col: ColumnMetadata) -> str:
         base_type = self.type_mapping.get(col.data_type, col.data_type)

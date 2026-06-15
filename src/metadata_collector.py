@@ -80,22 +80,50 @@ class ConstraintMetadata:
 
 
 @dataclass
+class PartitionIndexMetadata:
+    partition_name: str
+    partition_schema: str
+    index_name: str
+    index_definition: str
+    index_type: str
+    is_unique: bool
+    parent_index_name: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "partition_name": self.partition_name,
+            "partition_schema": self.partition_schema,
+            "index_name": self.index_name,
+            "index_definition": self.index_definition,
+            "index_type": self.index_type,
+            "is_unique": self.is_unique,
+            "parent_index_name": self.parent_index_name,
+        }
+
+
+@dataclass
 class PartitionMetadata:
     partition_type: str
     partition_key: List[str]
     partitions: List[Dict[str, Any]] = field(default_factory=list)
+    partition_indexes: List[PartitionIndexMetadata] = field(default_factory=list)
     chunk_time_interval: Optional[str] = None
     is_hypertable: bool = False
     hypertable_time_column: Optional[str] = None
+    num_dimensions: Optional[int] = None
+    partitioning_column: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "partition_type": self.partition_type,
             "partition_key": self.partition_key,
             "partitions": self.partitions,
+            "partition_indexes": [pi.to_dict() for pi in self.partition_indexes],
             "chunk_time_interval": self.chunk_time_interval,
             "is_hypertable": self.is_hypertable,
             "hypertable_time_column": self.hypertable_time_column,
+            "num_dimensions": self.num_dimensions,
+            "partitioning_column": self.partitioning_column,
         }
 
 
@@ -320,12 +348,43 @@ class MetadataCollector:
         indexes = self._get_indexes(adapter, table_name, schema)
         constraints = self._get_constraints(adapter, table_name, schema)
 
+        partition_key = [hyper_info["time_column_name"]]
+        num_dimensions = hyper_info.get("num_dimensions", 1)
+        partitioning_column = None
+
+        if num_dimensions > 1:
+            dims_query = """
+                SELECT
+                    column_name,
+                    interval_length,
+                    num_partitions
+                FROM timescaledb_information.dimensions
+                WHERE hypertable_schema = %s
+                  AND hypertable_name = %s
+                  AND dimension_type = 'Space'
+                ORDER BY dimension_number
+            """
+            try:
+                dims_result = adapter.execute_query(dims_query, (schema, table_name))
+                for dim in dims_result:
+                    partitioning_column = dim["column_name"]
+                    partition_key.append(dim["column_name"])
+            except Exception:
+                pass
+
+        partition_indexes = self._get_partition_indexes(
+            adapter, table_name, schema, is_hypertable=True
+        )
+
         partition_info = PartitionMetadata(
             partition_type="timescale_hypertable",
-            partition_key=[hyper_info["time_column_name"]],
+            partition_key=partition_key,
             chunk_time_interval=str(hyper_info["chunk_time_interval"]),
             is_hypertable=True,
             hypertable_time_column=hyper_info["time_column_name"],
+            num_dimensions=num_dimensions,
+            partitioning_column=partitioning_column,
+            partition_indexes=partition_indexes,
         )
 
         chunks = adapter.get_chunks(table_name, schema)
@@ -344,7 +403,8 @@ class MetadataCollector:
             hypertable_info={
                 "time_column_name": hyper_info["time_column_name"],
                 "chunk_time_interval": str(hyper_info["chunk_time_interval"]),
-                "num_dimensions": hyper_info["num_dimensions"],
+                "num_dimensions": num_dimensions,
+                "partitioning_column": partitioning_column,
             },
             compression_info=compression_info,
             chunks=chunks,
@@ -533,6 +593,92 @@ class MetadataCollector:
             )
         return constraints
 
+    def _get_partition_indexes(
+        self,
+        adapter: BaseDBAdapter,
+        table_name: str,
+        schema: str,
+        is_hypertable: bool = False,
+    ) -> List[PartitionIndexMetadata]:
+        if is_hypertable:
+            query = """
+                SELECT
+                    c.chunk_name as partition_name,
+                    c.chunk_schema as partition_schema,
+                    idx.indexname as index_name,
+                    idx.indexdef as index_definition,
+                    am.amname as index_type,
+                    i.indisunique as is_unique,
+                    pi.parent_index_name
+                FROM timescaledb_information.chunks c
+                JOIN pg_class pc ON pc.relname = c.chunk_name
+                JOIN pg_namespace pn ON pc.relnamespace = pn.oid
+                JOIN pg_indexes idx ON idx.indexname = pc.relname
+                    AND idx.schemaname = pn.nspname
+                JOIN pg_am am ON pc.relam = am.oid
+                JOIN pg_index i ON i.indexrelid = pc.oid
+                LEFT JOIN (
+                    SELECT
+                        h.schema as hypertable_schema,
+                        h.table_name as hypertable_name,
+                        idx2.indexname as parent_index_name
+                    FROM timescaledb_information.hypertables h
+                    JOIN pg_indexes idx2 ON idx2.tablename = h.table_name
+                        AND idx2.schemaname = h.schema
+                ) pi ON pi.hypertable_schema = c.hypertable_schema
+                    AND pi.hypertable_name = c.hypertable_name
+                WHERE c.hypertable_schema = %s
+                  AND c.hypertable_name = %s
+                  AND pc.relkind = 'i'
+                ORDER BY c.chunk_name, idx.indexname
+            """
+        else:
+            query = """
+                SELECT
+                    c_child.relname as partition_name,
+                    nm_child.nspname as partition_schema,
+                    idx.indexname as index_name,
+                    idx.indexdef as index_definition,
+                    am.amname as index_type,
+                    i.indisunique as is_unique,
+                    NULL as parent_index_name
+                FROM pg_inherits inh
+                JOIN pg_class c_parent ON inh.inhparent = c_parent.oid
+                JOIN pg_namespace nm_parent ON c_parent.relnamespace = nm_parent.oid
+                JOIN pg_class c_child ON inh.inhrelid = c_child.oid
+                JOIN pg_namespace nm_child ON c_child.relnamespace = nm_child.oid
+                JOIN pg_indexes idx ON idx.tablename = c_child.relname
+                    AND idx.schemaname = nm_child.nspname
+                JOIN pg_class ic ON ic.relname = idx.indexname
+                JOIN pg_am am ON ic.relam = am.oid
+                JOIN pg_index i ON i.indexrelid = ic.oid
+                WHERE nm_parent.nspname = %s
+                  AND c_parent.relname = %s
+                ORDER BY c_child.relname, idx.indexname
+            """
+
+        try:
+            result = adapter.execute_query(query, (schema, table_name))
+        except Exception:
+            return []
+
+        indexes = []
+        for row in result:
+            if self._should_exclude_index(row["index_name"]):
+                continue
+            indexes.append(
+                PartitionIndexMetadata(
+                    partition_name=row["partition_name"],
+                    partition_schema=row["partition_schema"],
+                    index_name=row["index_name"],
+                    index_definition=row["index_definition"],
+                    index_type=row["index_type"],
+                    is_unique=row["is_unique"],
+                    parent_index_name=row.get("parent_index_name"),
+                )
+            )
+        return indexes
+
     def _get_partition_info(
         self, adapter: BaseDBAdapter, table_name: str, schema: str
     ) -> Optional[PartitionMetadata]:
@@ -577,9 +723,14 @@ class MetadataCollector:
         """
         partitions = adapter.execute_query(partitions_query, (schema, table_name))
 
+        partition_indexes = self._get_partition_indexes(
+            adapter, table_name, schema, is_hypertable=False
+        )
+
         return PartitionMetadata(
             partition_type=partition_type,
             partition_key=partition_key,
             partitions=partitions,
+            partition_indexes=partition_indexes,
             is_hypertable=False,
         )
