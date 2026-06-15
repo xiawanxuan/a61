@@ -9,11 +9,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from typing import Dict, Optional
 
 from config_manager import ConfigManager
-from logger_rollback import LoggerRollbackManager, SyncPhase
+from logger_rollback import LoggerRollbackManager, SyncPhase, OperationType
 from db_adapter import DualDBManager, BaseDBAdapter
 from metadata_collector import MetadataCollector, DatabaseMetadata
 from diff_engine import DiffEngine, DiffResult
 from ddl_executor import DDLExecutor, DDLGenerator, GeneratedDDL
+from partition_capacity_checker import PartitionCapacityChecker, CapacityCheckResult, IssueSeverity
 
 
 class TimeSeriesSyncOrchestrator:
@@ -83,11 +84,24 @@ class TimeSeriesSyncOrchestrator:
                     success = True
                     return success
 
+                all_diffs = self._flatten_diffs(diff_results)
+                capacity_result = self._run_capacity_check(all_diffs)
+
+                if capacity_result and capacity_result.is_blocked:
+                    self.logger_manager.log_phase(
+                        SyncPhase.BLOCKED_BY_CAPACITY,
+                        f"Sync blocked by capacity check: {len(capacity_result.issues)} issues, "
+                        f"{sum(1 for i in capacity_result.issues if i.severity == IssueSeverity.ERROR)} errors",
+                        level=40,
+                    )
+                    success = False
+                    return success
+
                 preview_script = self.ddl_executor.generate_preview_script(ddls)
                 self._save_preview_script(preview_script, session.session_id)
 
                 if self.mode == "preview":
-                    self._print_preview(ddls, preview_script)
+                    self._print_preview(ddls, preview_script, capacity_result)
                     success = True
                 else:
                     operations = self._execute_ddls(ddls)
@@ -146,6 +160,82 @@ class TimeSeriesSyncOrchestrator:
         }
         return self.ddl_executor.execute(ddls, adapters, mode=self.mode)
 
+    def _flatten_diffs(self, diff_results: Dict[str, DiffResult]) -> list:
+        all_diffs = []
+        for direction, result in diff_results.items():
+            if hasattr(result, 'diffs'):
+                for diff in result.diffs:
+                    if hasattr(diff, 'to_dict'):
+                        diff_dict = diff.to_dict()
+                    else:
+                        diff_dict = dict(diff) if isinstance(diff, dict) else {}
+                    diff_dict["direction"] = direction
+                    all_diffs.append(diff_dict)
+        return all_diffs
+
+    def _get_target_adapter(self, direction: str) -> Optional[BaseDBAdapter]:
+        if direction == "forward":
+            return self.dual_db.timescale_db
+        elif direction == "backward":
+            return self.dual_db.business_pg
+        else:
+            return self.dual_db.timescale_db
+
+    def _run_capacity_check(self, diffs: list) -> Optional[CapacityCheckResult]:
+        try:
+            capacity_config = self.sync_config.capacity_check
+            if not capacity_config.enabled:
+                self.logger_manager.log_phase(
+                    SyncPhase.CAPACITY_CHECK,
+                    "Capacity check is disabled in configuration",
+                )
+                return None
+
+            target_adapter = self._get_target_adapter(self.direction)
+            if not target_adapter:
+                self.logger_manager.log_phase(
+                    SyncPhase.CAPACITY_CHECK,
+                    "No target adapter available, skipping capacity check",
+                )
+                return None
+
+            capacity_checker = PartitionCapacityChecker(
+                target_adapter=target_adapter,
+                config=capacity_config,
+                metadata_collector=self.metadata_collector,
+                logger=self.logger_manager.get_logger(),
+            )
+
+            result = capacity_checker.check_capacity(diffs, self.direction)
+
+            self.logger_manager.log_capacity_check_result(result.to_dict())
+
+            self._log_capacity_operations(result)
+
+            return result
+
+        except Exception as e:
+            self.logger_manager.log_phase(
+                SyncPhase.CAPACITY_CHECK,
+                f"Capacity check failed with error: {str(e)}",
+                level=30,
+            )
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _log_capacity_operations(self, result: CapacityCheckResult):
+        for issue in result.issues:
+            op_type = OperationType.CAPACITY_ERROR if issue.severity == IssueSeverity.ERROR else OperationType.CAPACITY_WARNING
+            self.logger_manager.create_operation(
+                operation_type=op_type,
+                source_db=self.direction,
+                target_db=self.direction,
+                table_name=issue.table_name,
+                sql_statement=issue.message,
+                rollback_sql="",
+            )
+
     def _save_preview_script(self, script: str, session_id: str):
         log_dir = self.sync_config.logging.log_dir
         preview_dir = os.path.join(log_dir, "previews")
@@ -164,7 +254,7 @@ class TimeSeriesSyncOrchestrator:
             f"Preview script saved to: {preview_file}",
         )
 
-    def _print_preview(self, ddls: list, script: str):
+    def _print_preview(self, ddls: list, script: str, capacity_result=None):
         print("\n" + "=" * 80)
         print(f"PREVIEW MODE - {len(ddls)} DDL Operations Generated")
         print("=" * 80)
@@ -180,6 +270,10 @@ class TimeSeriesSyncOrchestrator:
             print(f"  - {op_type}: {count}")
         print()
 
+        if capacity_result is not None:
+            self._print_capacity_result(capacity_result)
+            print()
+
         print("-" * 80)
         print("Generated SQL Script:")
         print("-" * 80)
@@ -187,6 +281,52 @@ class TimeSeriesSyncOrchestrator:
         print("=" * 80)
         print(f"To execute these changes, run with --mode execute")
         print("=" * 80 + "\n")
+
+    def _print_capacity_result(self, capacity_result):
+        def gb(bytes_val):
+            return bytes_val / (1024 ** 3) if bytes_val else 0
+
+        print("-" * 80)
+        print("Capacity Check Results:")
+        print("-" * 80)
+
+        if capacity_result.is_blocked:
+            print("  [BLOCKED] Sync is blocked by capacity issues")
+        elif capacity_result.has_errors:
+            print("  [ERROR] Capacity check found errors")
+        elif capacity_result.has_warnings:
+            print("  [WARNING] Capacity check found warnings")
+        else:
+            print("  [OK] Capacity check passed")
+
+        impacts = capacity_result.estimated_impacts
+        if impacts:
+            total_growth = impacts.get("total_estimated_growth_gb", 0)
+            print(f"\n  Estimated total storage impact: {total_growth:.3f} GB")
+
+            table_breakdown = impacts.get("table_breakdown", {})
+            if table_breakdown:
+                print("\n  Estimated impact by table:")
+                for table_name, growth_bytes in sorted(table_breakdown.items(), key=lambda x: -x[1]):
+                    print(f"    - {table_name}: {gb(growth_bytes):.3f} GB")
+
+        current_sizes = capacity_result.current_sizes
+        if current_sizes and "database" in current_sizes:
+            db = current_sizes["database"]
+            print(f"\n  Database current size: {gb(db.get('current_bytes', 0)):.2f} GB "
+                  f"({db.get('current_percent', 0):.1f}% of max)")
+            print(f"  Projected after sync: {gb(db.get('projected_bytes', 0)):.2f} GB "
+                  f"({db.get('projected_percent', 0):.1f}% of max)")
+
+        if capacity_result.issues:
+            print(f"\n  Issues ({len(capacity_result.issues)} total):")
+            for issue in capacity_result.issues:
+                prefix = "  [ERROR]" if issue.severity == IssueSeverity.ERROR else "  [WARN]"
+                table_info = f"[{issue.table_name}"
+                if issue.partition_name:
+                    table_info += f"/{issue.partition_name}"
+                table_info += "]"
+                print(f"  {prefix} {table_info} {issue.message}")
 
     def run_scheduled(self):
         import schedule

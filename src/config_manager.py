@@ -56,6 +56,27 @@ class LoggingConfig:
 
 
 @dataclass
+class CapacityCheckConfig:
+    enabled: bool
+    fail_on_overflow: bool
+    warning_threshold_percent: int
+    error_threshold_percent: int
+    max_database_size_gb: int
+    max_table_size_gb: int
+    max_partition_size_gb: int
+    estimated_index_overhead_percent: int
+    check_partition_overflow: bool
+    check_database_overflow: bool
+    check_table_overflow: bool
+    check_chunk_growth_rate: bool
+    chunk_growth_rate_days: int
+    max_chunk_growth_percent: int
+    estimate_new_column_size: bool
+    default_column_size_bytes: Dict[str, int]
+    excluded_tables_from_check: List[str]
+
+
+@dataclass
 class SyncConfig:
     sync_direction: str
     sync_mode: str
@@ -67,6 +88,7 @@ class SyncConfig:
     sync_rules: SyncRules
     execution_options: ExecutionOptions
     logging: LoggingConfig
+    capacity_check: CapacityCheckConfig
 
 
 class ConfigManager:
@@ -123,6 +145,25 @@ class ConfigManager:
             sync_rules=SyncRules(**data.get("sync_rules", {})),
             execution_options=ExecutionOptions(**data.get("execution_options", {})),
             logging=LoggingConfig(**data.get("logging", {})),
+            capacity_check=CapacityCheckConfig(**data.get("capacity_check", {
+                "enabled": False,
+                "fail_on_overflow": True,
+                "warning_threshold_percent": 80,
+                "error_threshold_percent": 95,
+                "max_database_size_gb": 1000,
+                "max_table_size_gb": 500,
+                "max_partition_size_gb": 100,
+                "estimated_index_overhead_percent": 20,
+                "check_partition_overflow": True,
+                "check_database_overflow": True,
+                "check_table_overflow": True,
+                "check_chunk_growth_rate": True,
+                "chunk_growth_rate_days": 7,
+                "max_chunk_growth_percent": 50,
+                "estimate_new_column_size": True,
+                "default_column_size_bytes": {},
+                "excluded_tables_from_check": [],
+            })),
         )
         return self._sync_config
 
@@ -169,3 +210,11 @@ class ConfigManager:
             f"postgresql+psycopg2://{db_config.user}:{db_config.password}"
             f"@{db_config.host}:{db_config.port}/{db_config.database}"
         )
+
+    def is_table_excluded_from_capacity_check(self, table_name: str) -> bool:
+        sync_config = self.load_sync_config()
+        excluded_tables = sync_config.capacity_check.excluded_tables_from_check
+        for pattern in excluded_tables:
+            if self._match_pattern(pattern, table_name):
+                return True
+        return False

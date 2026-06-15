@@ -79,6 +79,38 @@
         "stop_on_error": true
     },
 
+    "capacity_check": {
+        "enabled": true,
+        "fail_on_overflow": true,
+        "warning_threshold_percent": 80,
+        "error_threshold_percent": 95,
+        "max_database_size_gb": 1000,
+        "max_table_size_gb": 500,
+        "max_partition_size_gb": 100,
+        "estimated_index_overhead_percent": 20,
+        "check_partition_overflow": true,
+        "check_database_overflow": true,
+        "check_table_overflow": true,
+        "check_chunk_growth_rate": true,
+        "chunk_growth_rate_days": 7,
+        "max_chunk_growth_percent": 50,
+        "estimate_new_column_size": true,
+        "default_column_size_bytes": {
+            "bigint": 8,
+            "integer": 4,
+            "double precision": 8,
+            "text": 100,
+            "boolean": 1,
+            "timestamptz": 8,
+            "jsonb": 200,
+            "character varying": 50
+        },
+        "excluded_tables_from_check": [
+            "sync_logs",
+            "migration_*"
+        ]
+    },
+
     "logging": {
         "log_level": "INFO",
         "log_dir": "logs",

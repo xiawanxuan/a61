@@ -13,10 +13,12 @@ class SyncPhase(str, Enum):
     METADATA_COLLECT = "metadata_collect"
     DIFF_ANALYSIS = "diff_analysis"
     DDL_GENERATION = "ddl_generation"
+    CAPACITY_CHECK = "capacity_check"
     DDL_EXECUTION = "ddl_execution"
     ROLLBACK = "rollback"
     COMPLETED = "completed"
     FAILED = "failed"
+    BLOCKED_BY_CAPACITY = "blocked_by_capacity"
 
 
 class OperationType(str, Enum):
@@ -32,6 +34,9 @@ class OperationType(str, Enum):
     ALTER_CONSTRAINT = "alter_constraint"
     SET_COMPRESSION = "set_compression"
     SET_RETENTION = "set_retention"
+    CAPACITY_CHECK = "capacity_check"
+    CAPACITY_WARNING = "capacity_warning"
+    CAPACITY_ERROR = "capacity_error"
 
 
 @dataclass
@@ -60,6 +65,7 @@ class SyncSession:
     metadata_source: Optional[Dict[str, Any]] = None
     metadata_target: Optional[Dict[str, Any]] = None
     diff_result: Optional[Dict[str, Any]] = None
+    capacity_check_result: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -69,6 +75,7 @@ class SyncSession:
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "status": self.status,
             "operations": [asdict(op) for op in self.operations],
+            "capacity_check_result": self.capacity_check_result,
             "error_message": self.error_message,
         }
 
@@ -201,6 +208,35 @@ class LoggerRollbackManager:
             SyncPhase.DIFF_ANALYSIS,
             f"Diff analysis complete: {total_changes} changes detected",
             level=logging.INFO,
+        )
+
+    def log_capacity_check_result(self, capacity_result: Dict[str, Any]):
+        if self.current_session:
+            self.current_session.capacity_check_result = capacity_result
+
+        has_errors = capacity_result.get("has_errors", False)
+        has_warnings = capacity_result.get("has_warnings", False)
+        is_blocked = capacity_result.get("is_blocked", False)
+        total_issues = len(capacity_result.get("issues", []))
+
+        if is_blocked:
+            phase = SyncPhase.BLOCKED_BY_CAPACITY
+            level = logging.ERROR
+        elif has_errors:
+            phase = SyncPhase.CAPACITY_CHECK
+            level = logging.ERROR
+        elif has_warnings:
+            phase = SyncPhase.CAPACITY_CHECK
+            level = logging.WARNING
+        else:
+            phase = SyncPhase.CAPACITY_CHECK
+            level = logging.INFO
+
+        self.log_phase(
+            phase,
+            f"Capacity check complete: {total_issues} issues detected, "
+            f"errors={has_errors}, warnings={has_warnings}, blocked={is_blocked}",
+            level=level,
         )
 
     def create_operation(

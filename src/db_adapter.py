@@ -91,6 +91,100 @@ class BaseDBAdapter(ABC):
     def is_hypertable(self, table_name: str, schema: Optional[str] = None) -> bool:
         return False
 
+    def get_database_size(self) -> Dict[str, Any]:
+        query = """
+            SELECT
+                pg_database_size(current_database()) as size_bytes,
+                pg_size_pretty(pg_database_size(current_database())) as size_pretty
+        """
+        result = self.execute_query(query)
+        return result[0] if result else {"size_bytes": 0, "size_pretty": "0 bytes"}
+
+    def get_table_size(self, table_name: str, schema: Optional[str] = None) -> Dict[str, Any]:
+        schema = schema or self.db_config.schema
+        full_table_name = f"{schema}.{table_name}"
+        query = """
+            SELECT
+                pg_total_relation_size(%s) as total_size_bytes,
+                pg_size_pretty(pg_total_relation_size(%s)) as total_size_pretty,
+                pg_relation_size(%s) as table_size_bytes,
+                pg_size_pretty(pg_relation_size(%s)) as table_size_pretty,
+                pg_indexes_size(%s) as index_size_bytes,
+                pg_size_pretty(pg_indexes_size(%s)) as index_size_pretty,
+                pg_toast_relation_size(%s) as toast_size_bytes,
+                pg_size_pretty(pg_toast_relation_size(%s)) as toast_size_pretty,
+                c.reltuples as estimated_row_count
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s
+        """
+        params = (
+            full_table_name, full_table_name,
+            full_table_name, full_table_name,
+            full_table_name, full_table_name,
+            full_table_name, full_table_name,
+            schema, table_name,
+        )
+        result = self.execute_query(query, params)
+        return result[0] if result else {}
+
+    def get_all_tables_sizes(self, schema: Optional[str] = None) -> List[Dict[str, Any]]:
+        schema = schema or self.db_config.schema
+        query = """
+            SELECT
+                c.relname as table_name,
+                n.nspname as table_schema,
+                pg_total_relation_size(c.oid) as total_size_bytes,
+                pg_size_pretty(pg_total_relation_size(c.oid)) as total_size_pretty,
+                pg_relation_size(c.oid) as table_size_bytes,
+                pg_size_pretty(pg_relation_size(c.oid)) as table_size_pretty,
+                pg_indexes_size(c.oid) as index_size_bytes,
+                pg_size_pretty(pg_indexes_size(c.oid)) as index_size_pretty,
+                c.reltuples as estimated_row_count
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relkind = 'r'
+            ORDER BY pg_total_relation_size(c.oid) DESC
+        """
+        return self.execute_query(query, (schema,))
+
+    def get_partition_sizes(
+        self, table_name: str, schema: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        schema = schema or self.db_config.schema
+        query = """
+            SELECT
+                nm_child.nspname as partition_schema,
+                c_child.relname as partition_name,
+                pg_total_relation_size(c_child.oid) as total_size_bytes,
+                pg_size_pretty(pg_total_relation_size(c_child.oid)) as total_size_pretty,
+                pg_relation_size(c_child.oid) as table_size_bytes,
+                pg_size_pretty(pg_relation_size(c_child.oid)) as table_size_pretty,
+                pg_indexes_size(c_child.oid) as index_size_bytes,
+                pg_size_pretty(pg_indexes_size(c_child.oid)) as index_size_pretty,
+                c_child.reltuples as estimated_row_count,
+                pg_get_expr(c_child.relpartbound, c_child.oid) as partition_bound
+            FROM pg_inherits i
+            JOIN pg_class c_parent ON i.inhparent = c_parent.oid
+            JOIN pg_class c_child ON i.inhrelid = c_child.oid
+            JOIN pg_namespace nm_child ON c_child.relnamespace = nm_child.oid
+            JOIN pg_namespace nm_parent ON c_parent.relnamespace = nm_parent.oid
+            WHERE nm_parent.nspname = %s AND c_parent.relname = %s
+            ORDER BY pg_total_relation_size(c_child.oid) DESC
+        """
+        return self.execute_query(query, (schema, table_name))
+
+    def get_tablespace_info(self) -> List[Dict[str, Any]]:
+        query = """
+            SELECT
+                spcname as tablespace_name,
+                pg_tablespace_location(oid) as location,
+                pg_size_pretty(pg_tablespace_size(oid)) as size_pretty,
+                pg_tablespace_size(oid) as size_bytes
+            FROM pg_tablespace
+        """
+        return self.execute_query(query)
+
     def __enter__(self):
         self.connect()
         return self
@@ -286,6 +380,168 @@ class TimescaleDBAdapter(BaseDBAdapter):
 
         self.logger.info(f"Set chunk time interval for {full_table_name}: {interval}")
         return True
+
+    def get_hypertable_total_size(
+        self, hypertable_name: str, schema: Optional[str] = None
+    ) -> Dict[str, Any]:
+        schema = schema or self.db_config.schema
+        full_table_name = f"{schema}.{hypertable_name}"
+        query = """
+            SELECT
+                h.hypertable_name,
+                h.hypertable_schema,
+                h.total_size as total_size_bytes,
+                pg_size_pretty(h.total_size) as total_size_pretty,
+                h.table_size as table_size_bytes,
+                pg_size_pretty(h.table_size) as table_size_pretty,
+                h.index_size as index_size_bytes,
+                pg_size_pretty(h.index_size) as index_size_pretty,
+                h.toast_size as toast_size_bytes,
+                pg_size_pretty(h.toast_size) as toast_size_pretty,
+                h.compressed_size as compressed_size_bytes,
+                pg_size_pretty(h.compressed_size) as compressed_size_pretty,
+                h.uncompressed_size as uncompressed_size_bytes,
+                pg_size_pretty(h.uncompressed_size) as uncompressed_size_pretty,
+                h.compression_ratio
+            FROM timescaledb_information.hypertable_total_size h
+            WHERE h.hypertable_schema = %s AND h.hypertable_name = %s
+        """
+        result = self.execute_query(query, (schema, hypertable_name))
+        if result:
+            return result[0]
+
+        fallback_query = """
+            SELECT
+                %s as hypertable_name,
+                %s as hypertable_schema,
+                pg_total_relation_size(%s) as total_size_bytes,
+                pg_size_pretty(pg_total_relation_size(%s)) as total_size_pretty,
+                pg_relation_size(%s) as table_size_bytes,
+                pg_size_pretty(pg_relation_size(%s)) as table_size_pretty,
+                pg_indexes_size(%s) as index_size_bytes,
+                pg_size_pretty(pg_indexes_size(%s)) as index_size_pretty
+        """
+        params = (
+            hypertable_name, schema,
+            full_table_name, full_table_name,
+            full_table_name, full_table_name,
+            full_table_name, full_table_name,
+        )
+        result = self.execute_query(fallback_query, params)
+        return result[0] if result else {}
+
+    def get_hypertable_detailed_sizes(
+        self, schema: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        schema = schema or self.db_config.schema
+        query = """
+            SELECT
+                h.hypertable_name,
+                h.hypertable_schema,
+                h.total_size as total_size_bytes,
+                pg_size_pretty(h.total_size) as total_size_pretty,
+                h.table_size as table_size_bytes,
+                pg_size_pretty(h.table_size) as table_size_pretty,
+                h.index_size as index_size_bytes,
+                pg_size_pretty(h.index_size) as index_size_pretty,
+                h.compression_ratio,
+                h.num_chunks
+            FROM timescaledb_information.hypertable_total_size h
+            WHERE h.hypertable_schema = %s
+            ORDER BY h.total_size DESC
+        """
+        return self.execute_query(query, (schema,))
+
+    def get_chunk_size_history(
+        self,
+        hypertable_name: str,
+        days: int = 7,
+        schema: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        schema = schema or self.db_config.schema
+        query = """
+            SELECT
+                c.chunk_name,
+                c.chunk_schema,
+                c.hypertable_name,
+                c.range_start,
+                c.range_end,
+                c.is_compressed,
+                pg_total_relation_size(c.chunk_schema || '.' || c.chunk_name) as size_bytes,
+                pg_size_pretty(pg_total_relation_size(c.chunk_schema || '.' || c.chunk_name)) as size_pretty,
+                pg_relation_size(c.chunk_schema || '.' || c.chunk_name) as table_bytes,
+                pg_indexes_size(c.chunk_schema || '.' || c.chunk_name) as index_bytes
+            FROM timescaledb_information.chunks c
+            WHERE c.hypertable_schema = %s
+              AND c.hypertable_name = %s
+              AND c.range_start >= NOW() - INTERVAL '%s days'
+            ORDER BY c.range_start DESC
+        """
+        return self.execute_query(query, (schema, hypertable_name, days))
+
+    def get_chunk_growth_rate(
+        self,
+        hypertable_name: str,
+        days: int = 7,
+        schema: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        schema = schema or self.db_config.schema
+        query = """
+            WITH recent_chunks AS (
+                SELECT
+                    range_start,
+                    range_end,
+                    pg_total_relation_size(chunk_schema || '.' || chunk_name) as size_bytes,
+                    (range_end - range_start) as time_range
+                FROM timescaledb_information.chunks
+                WHERE hypertable_schema = %s
+                  AND hypertable_name = %s
+                  AND range_start >= NOW() - INTERVAL '%s days'
+                ORDER BY range_start
+            ),
+            chunk_stats AS (
+                SELECT
+                    COUNT(*) as chunk_count,
+                    SUM(size_bytes) as total_size_bytes,
+                    AVG(size_bytes) as avg_chunk_size_bytes,
+                    MAX(size_bytes) as max_chunk_size_bytes,
+                    MIN(size_bytes) as min_chunk_size_bytes
+                FROM recent_chunks
+            ),
+            time_span AS (
+                SELECT
+                    MAX(range_end) - MIN(range_start) as total_time_span
+                FROM recent_chunks
+            )
+            SELECT
+                cs.*,
+                ts.total_time_span,
+                CASE
+                    WHEN EXTRACT(EPOCH FROM ts.total_time_span) > 0
+                    THEN cs.total_size_bytes::float / EXTRACT(EPOCH FROM ts.total_time_span) * 86400
+                    ELSE 0
+                END as estimated_daily_growth_bytes
+            FROM chunk_stats cs, time_span ts
+        """
+        result = self.execute_query(query, (schema, hypertable_name, days))
+        return result[0] if result else {}
+
+    def get_disk_usage_summary(self) -> Dict[str, Any]:
+        query = """
+            SELECT
+                SUM(pg_total_relation_size(c.oid)) as total_table_size_bytes,
+                pg_size_pretty(SUM(pg_total_relation_size(c.oid))) as total_table_size_pretty,
+                SUM(pg_indexes_size(c.oid)) as total_index_size_bytes,
+                pg_size_pretty(SUM(pg_indexes_size(c.oid))) as total_index_size_pretty,
+                COUNT(*) FILTER (WHERE c.relkind = 'r') as table_count,
+                COUNT(*) FILTER (WHERE c.relkind = 'i') as index_count
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', '_timescaledb_internal')
+              AND c.relkind IN ('r', 'i')
+        """
+        result = self.execute_query(query)
+        return result[0] if result else {}
 
 
 class DBAdapterFactory:
