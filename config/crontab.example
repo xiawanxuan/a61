@@ -1,0 +1,85 @@
+# Crontab configuration for IoT Time Series Database Sync
+# Edit this file to set up automated sync jobs
+# Install with: crontab config/crontab.example
+
+# ========================================
+# Environment Variables
+# ========================================
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PROJECT_DIR=/opt/iot-ts-sync
+VENV_DIR=/opt/iot-ts-sync/venv
+PYTHON_BIN=${VENV_DIR}/bin/python
+
+# ========================================
+# Logging
+# ========================================
+MAILTO=""
+LOG_FILE=${PROJECT_DIR}/logs/crontab.log
+
+# ========================================
+# Sync Jobs
+# ========================================
+
+# Option 1: Run preview every 6 hours (default - safe mode, no changes)
+# Minute Hour Day Month Weekday Command
+0 */6 * * * cd ${PROJECT_DIR} && ${PYTHON_BIN} src/main.py --mode preview --verbose >> ${LOG_FILE} 2>&1
+
+# Option 2: Run execute sync every 6 hours (applies changes)
+# 0 */6 * * * cd ${PROJECT_DIR} && ${PYTHON_BIN} src/main.py --mode execute --verbose >> ${LOG_FILE} 2>&1
+
+# Option 3: Forward sync only (PG -> Timescale) every hour
+# 0 * * * * cd ${PROJECT_DIR} && ${PYTHON_BIN} src/main.py --mode execute --direction forward >> ${LOG_FILE} 2>&1
+
+# Option 4: Backward sync only (Timescale -> PG) once daily at midnight
+# 0 0 * * * cd ${PROJECT_DIR} && ${PYTHON_BIN} src/main.py --mode execute --direction backward >> ${LOG_FILE} 2>&1
+
+# ========================================
+# Log Rotation (optional)
+# ========================================
+# Compress old logs daily at 2 AM
+0 2 * * * find ${PROJECT_DIR}/logs -name "*.log" -mtime +7 -exec gzip {} \; >> ${LOG_FILE} 2>&1
+
+# Delete old logs older than 30 days
+0 3 * * * find ${PROJECT_DIR}/logs -name "*.gz" -mtime +30 -delete >> ${LOG_FILE} 2>&1
+
+# ========================================
+# Health Check (optional)
+# ========================================
+# Check if last sync was successful, alert if not
+*/30 * * * * cd ${PROJECT_DIR} && ${PYTHON_BIN} -c "
+import json, glob, os
+from datetime import datetime, timedelta
+
+log_dir = 'logs/sessions'
+recent_files = sorted(glob.glob(os.path.join(log_dir, '*.json')), reverse=True)[:5]
+
+has_failure = False
+for f in recent_files:
+    with open(f) as fh:
+        data = json.load(fh)
+        if data.get('status') == 'failed':
+            has_failure = True
+            print(f'ALERT: Failed sync session found: {data.get(\"session_id\")}')
+            break
+
+if not has_failure:
+    print(f'Health check OK at {datetime.now()} - last {len(recent_files)} sessions healthy')
+" >> ${LOG_FILE} 2>&1
+
+# ========================================
+# Usage Instructions
+# ========================================
+# To view current crontab: crontab -l
+# To edit crontab: crontab -e
+# To install this crontab: crontab config/crontab.example
+# To remove crontab: crontab -r
+#
+# Cron Syntax:
+# .---------------- minute (0 - 59)
+# |  .------------- hour (0 - 23)
+# |  |  .---------- day of month (1 - 31)
+# |  |  |  .------- month (1 - 12)
+# |  |  |  |  .---- day of week (0 - 6) (Sunday=0 or 7)
+# |  |  |  |  |
+# *  *  *  *  *  command to be executed

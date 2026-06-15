@@ -1,0 +1,91 @@
+{
+    "sync_direction": "bidirectional",
+    "sync_mode": "preview",
+    "auto_rollback": true,
+    "sync_interval_cron": "0 */6 * * *",
+
+    "whitelist": {
+        "tables": [
+            "iot_device_metrics",
+            "iot_sensor_data",
+            "device_events",
+            "telemetry_data"
+        ],
+        "schemas": ["public"]
+    },
+
+    "blacklist": {
+        "tables": [
+            "migration_history",
+            "sync_logs",
+            "temp_*",
+            "backup_*"
+        ],
+        "columns": [
+            "created_at",
+            "updated_at",
+            "row_version"
+        ]
+    },
+
+    "timescale_config": {
+        "hypertable_time_column": "time",
+        "chunk_time_interval": "interval '1 day'",
+        "partitioning_column": "device_id",
+        "number_partitions": 4,
+        "compression": {
+            "enabled": true,
+            "compress_after": "interval '7 days'",
+            "segmentby": ["device_id"],
+            "orderby": ["time DESC"]
+        },
+        "retention": {
+            "enabled": true,
+            "drop_after": "interval '365 days'"
+        }
+    },
+
+    "sync_rules": {
+        "column_type_mapping": {
+            "timestamp without time zone": "timestamptz",
+            "timestamp with time zone": "timestamptz",
+            "integer": "bigint",
+            "double precision": "double precision",
+            "text": "text",
+            "boolean": "boolean",
+            "jsonb": "jsonb"
+        },
+        "index_sync": {
+            "enabled": true,
+            "exclude_patterns": ["idx_%_temp", "%_old_idx"],
+            "include_primary_key": true,
+            "include_unique": true
+        },
+        "partition_sync": {
+            "enabled": true,
+            "auto_adjust_interval": true
+        },
+        "constraint_sync": {
+            "enabled": true,
+            "exclude_foreign_keys": true
+        }
+    },
+
+    "execution_options": {
+        "batch_size": 10,
+        "timeout_per_ddl": 300,
+        "retry_attempts": 3,
+        "retry_interval": 5,
+        "stop_on_error": true
+    },
+
+    "logging": {
+        "log_level": "INFO",
+        "log_dir": "logs",
+        "log_file_prefix": "sync_",
+        "enable_file_logging": true,
+        "enable_console_logging": true,
+        "max_log_size_mb": 100,
+        "backup_count": 10
+    }
+}
